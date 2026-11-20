@@ -43,7 +43,7 @@ class ProxyService : Service() {
             stopSelf()
             return START_NOT_STICKY
         }
-        startForeground(NOTIF_ID, buildNotification("Подключение…"))
+        startForeground(NOTIF_ID, buildNotification("Подключение…", android.R.drawable.stat_notify_sync))
         startServer()
         return START_STICKY
     }
@@ -66,7 +66,7 @@ class ProxyService : Service() {
             val msg = "SOCKS5 работает: 127.0.0.1:$localPort"
             Log.i(TAG, msg)
             sendStatus(msg)
-            updateNotification("SOCKS5: 127.0.0.1:$localPort")
+            updateNotification("SOCKS5: 127.0.0.1:$localPort", R.drawable.ic_tunnel)
         } else {
             started = false
             Log.e(TAG, "failed to bind port $localPort")
@@ -93,7 +93,7 @@ class ProxyService : Service() {
         sendBroadcast(i)
     }
 
-    private fun buildNotification(text: String): Notification {
+    private fun buildNotification(text: String, iconRes: Int): Notification {
         val pi = PendingIntent.getActivity(
             this, 0,
             Intent(this, MainActivity::class.java),
@@ -115,15 +115,14 @@ class ProxyService : Service() {
         return builder
             .setContentTitle("SOCKS5-туннель")
             .setContentText(text)
-            .setSmallIcon(android.R.drawable.ic_menu_send)
+            .setSmallIcon(iconRes)
             .setContentIntent(pi)
             .setOngoing(true)
             .build()
     }
 
-    private fun updateNotification(text: String) {
+    private fun updateNotification(text: String, iconRes: Int) {
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        nm.notify(NOTIF_ID, buildNotification(text))
+        nm.notify(NOTIF_ID, buildNotification(text, iconRes))
     }
 }
-
