@@ -1,280 +1,332 @@
 package ru.ruroot.sockstunnel
 
-import java.io.BufferedInputStream
-import java.io.BufferedOutputStream
-import java.io.ByteArrayOutputStream
+import android.util.Log
+import java.io.Closeable
 import java.io.DataInputStream
+import java.io.DataOutputStream
 import java.io.IOException
+import java.net.Inet4Address
+import java.net.Inet6Address
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
-import java.net.SocketException
-import javax.net.ssl.HttpsURLConnection
+import java.net.UnknownHostException
+import java.util.Collections
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 import javax.net.ssl.SSLSocket
+import javax.net.ssl.SSLSocketFactory
 
-/**
- * Локальный SOCKS5-сервер (127.0.0.1).
- *
- * Схема работы:
- *   приложение клиента -> локальный SOCKS5 :5557
- *        -> TLS-соединение с 3proxy (ruroot.ru:9443, сертификат проверяется)
- *        -> SOCKS5-рукопожатие с 3proxy (логин/пароль сервера)
- *        -> двусторонняя пересылка данных.
- *
- * На каждый запрос клиента открывается свой TLS-туннель, поэтому при обрыве
- * следующий запрос автоматически переподключится (повтор до 3 раз).
- */
 class Socks5Server(
-    private val localPort: Int,
-    private val requireLocalAuth: Boolean,
-    private val localUser: String?,
-    private val localPass: String?,
-    private val tunnelHost: String,
-    private val tunnelPort: Int,
-    private val tunnelUser: String,
-    private val tunnelPass: String,
-    private val onStatus: (String) -> Unit
-) : Thread("socks5-server") {
+    private val listenPort: Int,
+    private val serverHost: String,
+    private val serverPort: Int,
+    private val proxyUser: String?,
+    private val proxyPass: String?,
+    private val localAuthRequired: Boolean
+) {
+    private val running = AtomicBoolean(false)
+    private var serverSocket: ServerSocket? = null
+    private var acceptThread: Thread? = null
+    private val clients: MutableSet<Socket> = Collections.synchronizedSet(mutableSetOf())
+    private val pool: ExecutorService = Executors.newCachedThreadPool()
 
-    @Volatile private var running = true
-    private var server: ServerSocket? = null
-
-    override fun run() {
-        try {
+    fun start(): Boolean {
+        if (!running.compareAndSet(false, true)) return true
+        return try {
             val ss = ServerSocket()
             ss.reuseAddress = true
-            ss.bind(InetSocketAddress(InetAddress.getLoopbackAddress(), localPort))
-            server = ss
-            onStatus("SOCKS5 слушает 127.0.0.1:$localPort")
-            while (running) {
-                val client = try {
-                    ss.accept()
-                } catch (e: SocketException) {
-                    break
-                }
-                Thread({ handleClient(client) }, "socks-conn").start()
+            ss.bind(InetSocketAddress(InetAddress.getByName("127.0.0.1"), listenPort))
+            serverSocket = ss
+            acceptThread = Thread { acceptLoop() }.apply {
+                name = "socks5-accept"
+                start()
             }
+            Log.i(TAG, "SOCKS5 listening on 127.0.0.1:$listenPort")
+            true
         } catch (e: Exception) {
-            if (running) onStatus("Ошибка локального сервера: ${e.message ?: e.javaClass.simpleName}")
+            Log.e(TAG, "start failed", e)
+            running.set(false)
+            false
         }
-        onStatus("Локальный SOCKS5 остановлен")
     }
 
-    fun stopServer() {
-        running = false
-        try { server?.close() } catch (_: Exception) {}
+    fun stop() {
+        running.set(false)
+        for (s in clients.toList()) closeQuietly(s)
+        clients.clear()
+        val ss = serverSocket
+        serverSocket = null
+        closeQuietly(ss)
+        acceptThread = null
+    }
+
+    private fun acceptLoop() {
+        while (running.get()) {
+            val ss = serverSocket ?: break
+            val client: Socket = try {
+                ss.accept()
+            } catch (e: Exception) {
+                if (running.get()) Log.w(TAG, "accept: ${e.message}")
+                break
+            }
+            pool.execute { handleClient(client) }
+        }
     }
 
     private fun handleClient(client: Socket) {
-        var tunnel: SSLSocket? = null
+        clients.add(client)
+        var remote: Socket? = null
         try {
             client.tcpNoDelay = true
-            val inp = DataInputStream(BufferedInputStream(client.getInputStream()))
-            val out = BufferedOutputStream(client.getOutputStream())
+            client.soTimeout = 30000
+            val dis = DataInputStream(client.getInputStream())
+            val dos = DataOutputStream(client.getOutputStream())
 
-            // --- приветствие SOCKS5 (RFC 1928) ---
-            if (inp.readUnsignedByte() != 5) { client.close(); return }
-            val nMethods = inp.readUnsignedByte()
-            val methods = ByteArray(nMethods)
-            inp.readFully(methods)
-            val hasNoAuth = methods.contains(0x00.toByte())
-            val hasAuth = methods.contains(0x02.toByte())
-
-            val chosen: Int = when {
-                requireLocalAuth && hasAuth -> 0x02
-                !requireLocalAuth && hasNoAuth -> 0x00
-                else -> 0xFF // нет подходящего метода
-            }
-            out.write(byteArrayOf(0x05, chosen.toByte()))
-            out.flush()
-            if (chosen == 0xFF) { client.close(); return }
-
-            // --- локальная аутентификация (RFC 1929), если включена ---
-            if (chosen == 0x02) {
-                if (inp.readUnsignedByte() != 1) { client.close(); return }
-                val uLen = inp.readUnsignedByte()
-                val uname = ByteArray(uLen); inp.readFully(uname)
-                val pLen = inp.readUnsignedByte()
-                val passwd = ByteArray(pLen); inp.readFully(passwd)
-                val okU = localUser?.let { String(uname, Charsets.UTF_8) == it } ?: true
-                val okP = localPass?.let { String(passwd, Charsets.UTF_8) == it } ?: true
-                out.write(byteArrayOf(0x01, (if (okU && okP) 0 else 1).toByte()))
-                out.flush()
-                if (!(okU && okP)) { client.close(); return }
-            }
-
-            // --- запрос CONNECT ---
-            val ver = inp.readUnsignedByte()
-            val cmd = inp.readUnsignedByte()
-            inp.readUnsignedByte() // reserved
-            val atyp = inp.readUnsignedByte()
-            val addr: ByteArray = when (atyp) {
-                0x01 -> ByteArray(4).also { inp.readFully(it) }
-                0x03 -> {
-                    val l = inp.readUnsignedByte()
-                    ByteArray(l).also { inp.readFully(it) }
-                }
-                0x04 -> ByteArray(16).also { inp.readFully(it) }
-                else -> { reply(out, 0x08); client.close(); return }
-            }
-            val portHi = inp.readUnsignedByte()
-            val portLo = inp.readUnsignedByte()
-            val targetPort = (portHi shl 8) or portLo
-            if (ver != 5 || cmd != 0x01) { reply(out, 0x07); client.close(); return }
-
-            // --- туннель к 3proxy через TLS ---
-            tunnel = try {
-                openTunnel()
-            } catch (e: Exception) {
-                onStatus("Не удалось установить TLS: ${e.message ?: e.javaClass.simpleName}")
-                reply(out, 0x01)
-                client.close()
+            if (!handshakeLocal(dis, dos)) {
+                closeQuietly(client)
                 return
             }
 
-            val ok = try {
-                socks5HandshakeRemote(tunnel, atyp, addr, targetPort)
-            } catch (e: Exception) {
-                onStatus("Ошибка SOCKS5-рукопожатия с сервером: ${e.message ?: e.javaClass.simpleName}")
-                try { tunnel.close() } catch (_: Exception) {}
-                reply(out, 0x05)
-                client.close()
-                return
-            }
-            if (!ok) {
-                reply(out, 0x01)
-                client.close()
+            val target = readClientRequest(dis)
+            if (target == null) {
+                writeReply(dos, REPLY_GENERAL)
+                closeQuietly(client)
                 return
             }
 
-            onStatus("Туннель открыт: ${addrString(atyp, addr)}:$targetPort")
-            reply(out, 0x00)
-            pipe(client, tunnel)
+            remote = connectWithRetry(target)
+            if (remote == null) {
+                writeReply(dos, REPLY_FAILURE)
+                closeQuietly(client)
+                return
+            }
+
+            client.soTimeout = 0
+            remote.tcpNoDelay = true
+            remote.soTimeout = 0
+            writeReply(dos, REPLY_OK)
+            pump(client, remote)
         } catch (e: Exception) {
-            // любая ошибка просто закрывает соединение клиента
+            Log.d(TAG, "client: ${e.javaClass.simpleName}: ${e.message}")
         } finally {
-            try { client.close() } catch (_: Exception) {}
-            tunnel?.let { try { it.close() } catch (_: Exception) {} }
+            clients.remove(client)
+            closeQuietly(remote)
+            closeQuietly(client)
         }
     }
 
-    /** Подтверждение локальному клиенту (BIND-адрес не используется, ставим нули). */
-    private fun reply(out: BufferedOutputStream, code: Int) {
-        out.write(byteArrayOf(0x05, code.toByte(), 0x00, 0x01, 0, 0, 0, 0, 0, 0))
-        out.flush()
+    private fun handshakeLocal(dis: DataInputStream, dos: DataOutputStream): Boolean {
+        if (dis.readUnsignedByte() != 5) return false
+        val nmethods = dis.readUnsignedByte()
+        if (nmethods < 1) return false
+        val methods = ByteArray(nmethods)
+        dis.readFully(methods)
+        val supportsAuth = methods.contains(0x02.toByte())
+        val supportsNoAuth = methods.contains(0x00.toByte())
+        val chosen: Int = if (localAuthRequired) {
+            if (!supportsAuth) return false
+            0x02
+        } else {
+            if (!supportsNoAuth) return false
+            0x00
+        }
+        dos.write(byteArrayOf(5, chosen.toByte()))
+        dos.flush()
+        if (chosen == 0x02) {
+            if (dis.readUnsignedByte() != 1) return false
+            val ulen = dis.readUnsignedByte()
+            val user = ByteArray(ulen)
+            dis.readFully(user)
+            val plen = dis.readUnsignedByte()
+            val pass = ByteArray(plen)
+            dis.readFully(pass)
+            val ok = String(user, Charsets.UTF_8) == (proxyUser ?: "") &&
+                    String(pass, Charsets.UTF_8) == (proxyPass ?: "")
+            dos.write(byteArrayOf(1, if (ok) 0 else 1))
+            dos.flush()
+            if (!ok) return false
+        }
+        return true
     }
 
-    /** TLS-подключение к 3proxy с проверкой сертификата и повторами. */
-    private fun openTunnel(): SSLSocket {
-        var last: Exception? = null
-        var delay = 2000L
-        for (attempt in 1..3) {
-            try {
-                val plain = Socket()
-                plain.connect(InetSocketAddress(tunnelHost, tunnelPort), 10000)
-                plain.tcpNoDelay = true
+    private fun readClientRequest(dis: DataInputStream): InetSocketAddress? {
+        if (dis.readUnsignedByte() != 5) return null
+        if (dis.readUnsignedByte() != 1) return null // поддерживаем только CONNECT
+        dis.readUnsignedByte() // RSV
+        val atyp = dis.readUnsignedByte()
+        val host: String = when (atyp) {
+            1 -> {
+                val b = ByteArray(4)
+                dis.readFully(b)
+                InetAddress.getByAddress(b).hostAddress ?: return null
+            }
+            3 -> {
+                val len = dis.readUnsignedByte()
+                val b = ByteArray(len)
+                dis.readFully(b)
+                String(b, Charsets.ISO_8859_1)
+            }
+            4 -> {
+                val b = ByteArray(16)
+                dis.readFully(b)
+                InetAddress.getByAddress(b).hostAddress ?: return null
+            }
+            else -> return null
+        }
+        val port = dis.readUnsignedShort()
+        return InetSocketAddress.createUnresolved(host, port)
+    }
 
-                // системное хранилище сертификатов + проверка имени хоста
-                val factory = HttpsURLConnection.getDefaultSSLSocketFactory()
-                val ssl = factory.createSocket(plain, tunnelHost, tunnelPort, true) as SSLSocket
-                val params = ssl.sslParameters
-                params.endpointIdentificationAlgorithm = "HTTPS"
-                ssl.sslParameters = params
-                ssl.soTimeout = 15000 // только на время рукопожатия
-                ssl.startHandshake()
-                ssl.soTimeout = 0 // дальше без таймаута: долгоживущий туннель
-                onStatus(
-                    if (attempt == 1) "TLS: $tunnelHost:$tunnelPort подключён"
-                    else "TLS: подключён (попытка $attempt)"
-                )
-                return ssl
+    private fun writeReply(dos: DataOutputStream, code: Int) {
+        dos.write(byteArrayOf(5, code.toByte(), 0, 1, 0, 0, 0, 0, 0, 0))
+        dos.flush()
+    }
+
+    private fun connectWithRetry(target: InetSocketAddress): Socket? {
+        var delayMs = 1000L
+        var attempt = 1
+        while (attempt <= RETRY_ATTEMPTS) {
+            if (!running.get()) return null
+            try {
+                return openTunnel(target)
             } catch (e: Exception) {
-                last = e
-                if (attempt < 3) {
-                    onStatus("TLS: не удалось (попытка $attempt), повтор через ${delay / 1000} с")
-                    try { sleep(delay) } catch (_: InterruptedException) {}
-                    delay *= 2
+                Log.w(TAG, "attempt $attempt: ${e.message}")
+                if (attempt == RETRY_ATTEMPTS) return null
+                try {
+                    Thread.sleep(delayMs)
+                } catch (_: InterruptedException) {
+                    return null
                 }
+                delayMs *= 2
+                attempt++
             }
         }
-        throw last ?: IOException("Не удалось подключиться")
+        return null
     }
 
-    /** SOCKS5-рукопожатие с 3proxy: авторизация + CONNECT на цель. */
-    private fun socks5HandshakeRemote(ssl: Socket, atyp: Int, addr: ByteArray, port: Int) {
-        val inp = DataInputStream(BufferedInputStream(ssl.getInputStream()))
-        val out = BufferedOutputStream(ssl.getOutputStream())
+    @Throws(IOException::class)
+    private fun openTunnel(target: InetSocketAddress): Socket {
+        val factory = SSLSocketFactory.getDefault() as SSLSocketFactory
+        val socket: SSLSocket = factory.createSocket() as? SSLSocket
+            ?: throw IOException("cannot create TLS socket")
+        socket.tcpNoDelay = true
+        socket.connect(InetSocketAddress(serverHost, serverPort), CONNECT_TIMEOUT_MS)
+        socket.soTimeout = CONNECT_TIMEOUT_MS
+        socket.startHandshake()
 
-        out.write(byteArrayOf(0x05, 0x01, 0x02))
-        out.flush()
-        if (inp.readUnsignedByte() != 5) throw IOException("сервер ответил не SOCKS5")
-        val method = inp.readUnsignedByte()
-        if (method == 0x02) {
-            val ub = tunnelUser.toByteArray(Charsets.UTF_8)
-            val pb = tunnelPass.toByteArray(Charsets.UTF_8)
-            if (ub.size > 255 || pb.size > 255) throw IOException("слишком длинный логин/пароль")
-            val auth = ByteArrayOutputStream()
-            auth.write(0x01); auth.write(ub.size); auth.write(ub)
-            auth.write(pb.size); auth.write(pb)
-            out.write(auth.toByteArray()); out.flush()
-            if (inp.readUnsignedByte() != 0x01) throw IOException("сервер: некорректный ответ авторизации")
-            if (inp.readUnsignedByte() != 0x00) throw IOException("сервер отклонил логин/пароль")
-        } else if (method != 0x00) {
-            throw IOException("сервер выбрал неподдерживаемый метод ($method)")
+        val dis = DataInputStream(socket.getInputStream())
+        val dos = DataOutputStream(socket.getOutputStream())
+
+        dos.write(byteArrayOf(5, 2))
+        dos.flush()
+        if (dis.readUnsignedByte() != 5) throw IOException("bad server version")
+        if (dis.readUnsignedByte() != 2) throw IOException("server refused auth")
+
+        val user = proxyUser?.toByteArray(Charsets.UTF_8) ?: ByteArray(0)
+        val pass = proxyPass?.toByteArray(Charsets.UTF_8) ?: ByteArray(0)
+        if (user.size > 255 || pass.size > 255) throw IOException("credentials too long")
+        dos.writeByte(1)
+        dos.writeByte(user.size)
+        dos.write(user)
+        dos.writeByte(pass.size)
+        dos.write(pass)
+        dos.flush()
+        if (dis.readUnsignedByte() != 1) throw IOException("bad auth response")
+        if (dis.readUnsignedByte() != 0) throw IOException("auth rejected")
+
+        val hostBytes: ByteArray
+        val atyp: Int
+        val addr: InetAddress? = try {
+            InetAddress.getByName(target.hostString)
+        } catch (_: UnknownHostException) {
+            null
         }
-
-        val req = ByteArrayOutputStream()
-        req.write(0x05); req.write(0x01); req.write(0x00); req.write(atyp)
-        if (atyp == 0x03) req.write(addr.size)
-        req.write(addr)
-        req.write((port shr 8) and 0xFF)
-        req.write(port and 0xFF)
-        out.write(req.toByteArray()); out.flush()
-
-        if (inp.readUnsignedByte() != 5) throw IOException("сервер: некорректный ответ CONNECT")
-        val rep = inp.readUnsignedByte()
-        inp.readUnsignedByte() // reserved
-        val ratyp = inp.readUnsignedByte()
-        val blen = when (ratyp) {
-            0x01 -> 4
-            0x04 -> 16
-            0x03 -> inp.readUnsignedByte()
-            else -> 0
+        when {
+            addr is Inet4Address -> { atyp = 1; hostBytes = addr.address }
+            addr is Inet6Address -> { atyp = 4; hostBytes = addr.address }
+            else -> { atyp = 3; hostBytes = target.hostString.toByteArray(Charsets.ISO_8859_1) }
         }
-        if (blen > 0) { val b = ByteArray(blen); inp.readFully(b) }
-        inp.readUnsignedByte(); inp.readUnsignedByte() // bound port
-        if (rep != 0) throw IOException("сервер отказал в CONNECT (код $rep)")
+        dos.writeByte(5)
+        dos.writeByte(1)
+        dos.writeByte(0)
+        dos.writeByte(atyp)
+        if (atyp == 3) {
+            dos.writeByte(hostBytes.size)
+        }
+        dos.write(hostBytes)
+        dos.writeShort(target.port)
+        dos.flush()
+
+        if (dis.readUnsignedByte() != 5) throw IOException("bad server reply")
+        val rep = dis.readUnsignedByte()
+        if (rep != 0) throw IOException("server error code $rep")
+        dis.readUnsignedByte() // RSV
+        val batyp = dis.readUnsignedByte()
+        when (batyp) {
+            1 -> { val b = ByteArray(4); dis.readFully(b) }
+            4 -> { val b = ByteArray(16); dis.readFully(b) }
+            3 -> {
+                val n = dis.readUnsignedByte()
+                val b = ByteArray(n)
+                dis.readFully(b)
+            }
+        }
+        dis.readUnsignedShort() // bnd port
+        return socket
     }
 
-    /** Двусторонняя пересылка: когда одно направление обрывается, закрываем оба сокета. */
-    private fun pipe(a: Socket, b: Socket) {
-        val t = Thread({ copyOneWay(a, b) }, "pipe-1")
-        t.start()
-        copyOneWay(b, a)
-        try { t.join(2000) } catch (_: InterruptedException) {}
+    private fun pump(a: Socket, b: Socket) {
+        val t1 = Thread { copy(a, b) }.apply { name = "pump-ab" }
+        val t2 = Thread { copy(b, a) }.apply { name = "pump-ba" }
+        t1.start()
+        t2.start()
+        try {
+            t1.join()
+        } catch (_: InterruptedException) {
+        }
+        closeQuietly(a)
+        closeQuietly(b)
+        try {
+            t2.join(3000)
+        } catch (_: InterruptedException) {
+        }
     }
 
-    private fun copyOneWay(from: Socket, to: Socket) {
+    private fun copy(from: Socket, to: Socket) {
         val buf = ByteArray(16384)
         try {
-            val inp = from.getInputStream()
-            val out = to.getOutputStream()
+            val src = from.getInputStream()
+            val dst = to.getOutputStream()
             while (true) {
-                val n = inp.read(buf)
+                val n = src.read(buf)
                 if (n < 0) break
-                out.write(buf, 0, n)
-                out.flush()
+                dst.write(buf, 0, n)
+                dst.flush()
             }
-        } catch (_: IOException) {
+        } catch (_: Exception) {
         } finally {
-            try { from.close() } catch (_: Exception) {}
-            try { to.close() } catch (_: Exception) {}
+            closeQuietly(from)
+            closeQuietly(to)
         }
     }
 
-    private fun addrString(atyp: Int, addr: ByteArray): String = when (atyp) {
-        0x03 -> String(addr, Charsets.UTF_8)
-        else -> addr.joinToString(".") { (it.toInt() and 0xFF).toString() }
+    private fun closeQuietly(c: Closeable?) {
+        if (c == null) return
+        try {
+            c.close()
+        } catch (_: Exception) {
+        }
+    }
+
+    companion object {
+        private const val TAG = "Socks5Server"
+        private const val CONNECT_TIMEOUT_MS = 15000
+        private const val RETRY_ATTEMPTS = 3
+        private const val REPLY_OK = 0x00
+        private const val REPLY_GENERAL = 0x01
+        private const val REPLY_FAILURE = 0x01
     }
 }
