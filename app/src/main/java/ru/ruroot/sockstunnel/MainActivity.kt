@@ -48,6 +48,9 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 1)
+        }
         buildUi()
         loadSettings()
         updateButtons()
@@ -127,17 +130,18 @@ class MainActivity : AppCompatActivity() {
         p.apply()
     }
 
-    private fun startProxy() {
-        saveSettings()
-        val i = Intent(this, ProxyService::class.java).setAction(ProxyService.ACTION_START)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            startForegroundService(i)
-        } else {
-            startService(i)
-        }
-        tvStatus.text = "Подключение…"
-        updateButtons()
+   private fun startProxy() {
+    saveSettings()
+    val i = Intent(this, ProxyService::class.java).setAction(ProxyService.ACTION_START)
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        startForegroundService(i)
+    } else {
+        startService(i)
     }
+    tvStatus.text = "Подключение…"
+    updateButtons()
+}
+
 
     private fun stopProxy() {
         val i = Intent(this, ProxyService::class.java).setAction(ProxyService.ACTION_STOP)
